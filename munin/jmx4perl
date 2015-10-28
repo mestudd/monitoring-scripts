@@ -1,0 +1,192 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use JMX::Jmx4Perl;
+use YAML::XS 'LoadFile';
+
+=head1 CONFIGURATION
+
+Configuration is in YAML format and closely follows the munin graph definition.
+The top-level is a list of jolokia instances to connect to. Each instance must
+have the parameters passed to the Jmx4Perl constructor, typically url, user,
+and password. Each instance has a graph attribute, which is a map of graph
+definitions. The name of the graph is the key, and the value is the munin graph
+configuration values for the graph (except for the data definitions). The data
+attribute of a graph contains a list of data definitions. The definitions
+follow the munin configuration, with several things added to specify where in
+jolokia to retrieve the values: mbean, attribute, path.
+
+See the munin reference at https://munin.readthedocs.org/en/latest/reference/plugin.html
+
+An example:
+
+    ---
+    - url: 'http://mstudd:8080/jolokia'
+      user: nagios
+      password: Default123!
+      graph:
+        wildfly_memory:
+          graph_title: Wildfly Memory
+          graph_category: wildfly
+          graph_vlabel: memory
+          graph_args: '--lower-limit 0'
+          data:
+            heap_committed:
+              label: Heap Committed
+              mbean: 'java.lang:type=Memory'
+              attribute: HeapMemoryUsage
+              path: committed
+            heap_used:
+              label: Heap Used
+              mbean: 'java.lang:type=Memory'
+              attribute: HeapMemoryUsage
+              path: used
+            nonheap_committed:
+              label: NonHeap Committed
+              mbean: 'java.lang:type=Memory'
+              attribute: NonHeapMemoryUsage
+              path: committed
+            nonheap_used:
+              label: NonHeap Used
+              mbean: 'java.lang:type=Memory'
+              attribute: NonHeapMemoryUsage
+              path: used
+        wildfly_threads:
+          graph_title: Wildfly Threads
+          graph_category: wildfly
+          graph_vlabel: count
+          graph_args: '--lower-limit 0'
+          data:
+            threads:
+              label: Threads
+              mbean: 'java.lang:type=Threading'
+              attribute: ThreadCount
+            threads_daemon:
+              label: Daemon Threads
+              mbean: 'java.lang:type=Threading'
+              attribute: DaemonThreadCount
+
+
+=cut
+
+sub main {
+	my $config = LoadFile('/etc/munin/jmx4perl.yaml');
+
+	print_config($config)
+		if (defined $ARGV[0] && $ARGV[0] eq 'config');
+
+	print_values($config);
+}
+
+sub graphs {
+	my $config = shift;
+
+	my @graphs;
+	foreach my $jolokia (@$config) {
+		foreach my $name (sort keys %{$jolokia->{graph}}) {
+			push @graphs, [$name, $jolokia->{graph}->{$name}];
+		}
+	}
+
+	return @graphs;
+}
+
+sub print_config {
+	my $config = shift;
+
+	foreach (graphs($config)) {
+		print_graph($_->[0], $_->[1]);
+	}
+}
+
+sub print_graph {
+	my $name = shift;
+	my $definition = shift;
+
+	die "Must define graph_title for each graph.\n"
+		if (!exists $definition->{graph_title});
+
+	print 'multigraph ', $name, "\n";
+	foreach my $attribute (qw(graph_title graph_category graph_info host_name update update_rate graph_vlabel graph_period graph_scale graph_printf graph_height graph_width graph_args graph_order graph_total)) {
+		print $attribute, ' ', $definition->{$attribute}, "\n"
+			if (exists $definition->{$attribute});
+	}
+
+	foreach my $data (sort keys %{$definition->{data}}) {
+		my $data_definition = $definition->{data}->{$data};
+		foreach my $attribute (qw(label type info extinfo cdef negative stack sum graph draw colour min max warning critical line)) {
+			print $data, '.', $attribute, ' ', $data_definition->{$attribute}, "\n"
+				if (exists $data_definition->{$attribute});
+		}
+	}
+	print "\n";
+}
+
+sub print_graph_values {
+	my ($name, $definition, $values) = @_;
+
+	print 'multigraph ', $name, "\n";
+	foreach my $data (sort keys %{$definition->{data}}) {
+		my $data_definition = $definition->{data}->{$data};
+		my $value = $values->{$data_definition->{mbean}}->{$data_definition->{attribute}};
+
+		if (defined $data_definition->{path}) {
+			my @path = split(/\./, $data_definition->{path});
+			while (@path) {
+				my $next = shift @path;
+				$value = ref($value) eq 'ARRAY' ? $value->[$next] : $value->{$next};
+			}
+		}
+
+		print $data, '.value ', $value, "\n"
+			if (defined $value);
+	}
+	print "\n";
+}
+
+sub print_values {
+	my $config = shift;
+
+	foreach my $jolokia (@$config) {
+		my $values = request_values($jolokia);
+		foreach my $name (sort keys %{$jolokia->{graph}}) {
+			print_graph_values($name, $jolokia->{graph}->{$name}, $values);
+		}
+	}
+}
+
+sub request_consolidation {
+	my $jolokia = shift;
+
+	my %things;
+	foreach (keys %{$jolokia->{graph}}) {
+		foreach my $data (values %{$jolokia->{graph}->{$_}->{data}}) {
+			my $mbean = $data->{mbean};
+			if (!exists $things{$mbean}) {
+				$things{$mbean} = [ $data->{attribute} ];
+			} else {
+				push @{$things{$mbean}}, $data->{attribute};
+			}
+		}
+	}
+
+	return map [ $_, $things{$_} ], keys %things;
+}
+
+sub request_values {
+	my $jolokia = shift;
+
+	my %args = %$jolokia;
+	delete $args{graph};
+	my $jmx = JMX::Jmx4Perl->new(\%args);
+
+	my %values = ();
+	foreach my $request (request_consolidation($jolokia)) {
+		$values{$request->[0]} = $jmx->get_attribute(@$request);
+	}
+
+	return \%values;
+}
+
+main();
